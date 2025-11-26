@@ -1,0 +1,27 @@
+# Database Configuration
+POSTGRES_USER=alfauser
+POSTGRES_PASSWORD=alfapass123
+POSTGRES_DB=alfa_minerals
+DB_PORT=5432
+
+# pgAdmin Configuration
+PGADMIN_EMAIL=admin@alfa.local
+PGADMIN_PASSWORD=pgadmin123
+PGADMIN_PORT=5050
+
+# Prefect Configuration
+PREFECT_API_PORT=4200
+PREFECT_LOG_LEVEL=INFO
+
+# Streamlit Configuration
+STREAMLIT_PORT=8501
+STREAMLIT_LOG_LEVEL=info
+API_PORT=8000
+
+# Build Configuration
+BUILD_TARGET=production  # Use 'development' or 'production'
+DEBUG=false
+
+# Application Configuration
+PYTHONUNBUFFERED=1
+PYTHONDONTWRITEBYTECODE=1

@@ -1,0 +1,68 @@
+# ============================================================================
+# ALFA MINERALS - Python Data Engineering Stack
+# Python 3.11 compatible packages optimized for geophysical data processing
+# ============================================================================
+
+# Core Web Framework
+streamlit==1.28.1
+streamlit-option-menu==0.3.6
+
+# Orchestration & Workflows
+prefect==2.14.21
+prefect[postgres]==2.14.21
+
+# Database Drivers
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.23
+alembic==1.12.1
+python-dotenv==1.0.0
+
+# Data Processing & Analysis
+pandas==2.1.3
+polars==0.19.12
+numpy==1.24.3
+scipy==1.11.4
+
+# Machine Learning & Scientific
+scikit-learn==1.3.2
+statsmodels==0.14.0
+
+# Geophysics & GIS Tools
+pyproj==3.6.1
+rasterio==1.3.9
+fiona==1.9.5
+shapely==2.0.2
+
+# Visualization
+plotly==5.18.0
+matplotlib==3.8.2
+seaborn==0.13.0
+bokeh==3.3.1
+folium==0.14.0
+streamlit-folium==0.15.0
+
+# Data Quality & Validation
+pydantic==2.5.0
+great-expectations==0.18.13
+
+# File Processing
+python-dateutil==2.8.2
+pyarrow==14.0.1
+
+# Utilities & Helpers
+requests==2.31.0
+httpx==0.25.1
+click==8.1.7
+loguru==0.7.2
+
+# Development Tools (optional, can be in separate dev-requirements.txt)
+pytest==7.4.3
+pytest-cov==4.1.0
+black==23.12.0
+flake8==6.1.0
+mypy==1.7.1
+
+# Prefect dependencies (missing)
+griffe==0.42.0
+pydantic==2.5.0
+
