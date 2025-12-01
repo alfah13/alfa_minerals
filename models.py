@@ -1,8 +1,10 @@
 from sqlalchemy import Column, Integer, Float, String, DateTime, Boolean, Enum, ForeignKey, UniqueConstraint, Index, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
+from geoalchemy2 import Geometry
 from datetime import datetime
 import enum
+
 
 Base = declarative_base()
 
@@ -66,6 +68,11 @@ class Loop(Base):
     elevation = Column(Float)
     coordinate_units = Column(String(10), default="metres")  # "metres" or "feet"
     
+    # PostGIS geometry: Point with SRID 26918 (UTM Zone 18N)
+    geometry = Column(Geometry("POINT", srid=26918), index=True, nullable=True)
+    # WGS84 geometry for web mapping
+    geometry_wgs84 = Column(Geometry("POINT", srid=4326), index=True, nullable=True)
+    
     # Loop geometry (from <TXS> tag)
     loop_size_x_units = Column(Float)  # 600.0
     loop_size_y_units = Column(Float)  # 700.0
@@ -98,6 +105,11 @@ class ReceiverStation(Base):
     elevation = Column(Float)
     coordinate_units = Column(String(10), default="metres")
     
+    # PostGIS geometry: Point with SRID 26918 (UTM Zone 18N)
+    geometry = Column(Geometry("POINT", srid=26918), index=True, nullable=True)
+    # WGS84 geometry for web mapping
+    geometry_wgs84 = Column(Geometry("POINT", srid=4326), index=True, nullable=True)
+    
     # Survey distance along profile
     distance_along_profile_m = Column(Float)  # "stn" field: 0.0, 25.0, 50.0, etc.
     
@@ -118,6 +130,7 @@ class ComponentEnum(enum.Enum):
     X = "X"
     Y = "Y"
     Z = "Z"
+    UNK = "UNK"  # Unknown/unclassified
 
 
 class EMResponse(Base):
@@ -129,7 +142,10 @@ class EMResponse(Base):
     receiver_station_id = Column(Integer, ForeignKey("receiver_stations.id"), nullable=False)
     
     # Component
-    component = Column(Enum(ComponentEnum), nullable=False)  # X, Y, Z
+    component = Column(Enum(ComponentEnum), nullable=False)  # X, Y, Z, UNK
+    
+    # Source file (allows same response from different files)
+    source_file = Column(String(255), nullable=False)  # e.g., "100EAV.STP", "200EAV.STP"
     
     # Station identifiers from file
     station_label = Column(String(50))  # "0N", "25N", etc.
@@ -142,17 +158,17 @@ class EMResponse(Base):
     instrument_id = Column(String(50))  # Instrument identifier
     
     # Primary pulse response
-    primary_pulse_nt_per_sec = Column(Float, nullable=False)  # First value (e.g., 49.07, 1271, 41264)
+    primary_pulse_nt_per_sec = Column(Float, nullable=False)
     
     # Secondary values
-    secondary_pulse_1 = Column(Float)  # Second column value
-    secondary_pulse_2 = Column(Float)  # Third column value (often duplicate)
+    secondary_pulse_1 = Column(Float)
+    secondary_pulse_2 = Column(Float)
     
     # Decay info
-    current_on_time_value = Column(Float)  # "D4" line first value (49.074)
-    apparent_resistance = Column(Float)  # Second D4 value (-2310.1)
-    phase_component = Column(Float)  # Third D4 value (41264)
-    phase_magnitude = Column(Float)  # Fourth D4 value (41328.7)
+    current_on_time_value = Column(Float)
+    apparent_resistance = Column(Float)
+    phase_component = Column(Float)
+    phase_magnitude = Column(Float)
     
     # Raw data quality
     is_valid = Column(Boolean, default=True)
@@ -164,9 +180,11 @@ class EMResponse(Base):
     survey = relationship("Survey", back_populates="measurements")
     receiver_station = relationship("ReceiverStation", back_populates="measurements")
     channels = relationship("OffTimeChannel", back_populates="response", cascade="all, delete-orphan")
+    anomalies = relationship("Anomaly", back_populates="response", cascade="all, delete-orphan")
     
     __table_args__ = (
-        UniqueConstraint("survey_id", "receiver_station_id", "component", name="uq_response"),
+        # Allow same (survey, station, component) but different files
+        UniqueConstraint("survey_id", "receiver_station_id", "component", "source_file", name="uq_response_per_file"),
         Index("idx_response_component", "receiver_station_id", "component"),
     )
 
@@ -234,3 +252,7 @@ class Anomaly(Base):
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    response = relationship("EMResponse", back_populates="anomalies")
+

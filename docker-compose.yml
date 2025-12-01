@@ -1,19 +1,26 @@
 version: '3.9'
 
+
 services:
   postgres:
-    image: postgres:15-alpine
-    container_name: alfa_minerals_postgres
+    image: postgis/postgis:15-3.3
+    container_name: alfa_postgres
     environment:
       POSTGRES_USER: alfauser
       POSTGRES_PASSWORD: alfapass123
       POSTGRES_DB: alfa_minerals
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - alfa_minerals_network
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alfauser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -28,6 +35,7 @@ services:
     networks:
       - alfa_minerals_network
 
+
   prefect-server:
     image: prefecthq/prefect:2-latest
     container_name: alfa_minerals_prefect_server
@@ -35,13 +43,18 @@ services:
     environment:
       PREFECT_API_URL: http://0.0.0.0:4200/api
       PREFECT_API_ENABLE_HTTP2: "false"
+      # Result storage configuration
+      PREFECT_RESULTS_DEFAULT_STORAGE_BLOCK: "local-file-system/default"
+      PREFECT_LOGGING_LEVEL: "INFO"
     ports:
       - "4200:4200"
     volumes:
       - prefect_data:/root/.prefect
+      - prefect_results:/root/.prefect/results
     networks:
       - alfa_minerals_network
     restart: unless-stopped
+
 
   prefect-agent:
     image: prefecthq/prefect:2-latest
@@ -49,14 +62,17 @@ services:
     entrypoint: ["prefect", "agent", "start", "-q", "default"]
     environment:
       PREFECT_API_URL: http://prefect-server:4200/api
+      PREFECT_RESULTS_DEFAULT_STORAGE_BLOCK: "local-file-system/default"
     depends_on:
       - prefect-server
     volumes:
       - .:/app:ro
+      - prefect_results:/root/.prefect/results
     working_dir: /app
     networks:
       - alfa_minerals_network
     restart: unless-stopped
+
 
   streamlit:
     build:
@@ -81,6 +97,7 @@ services:
       - alfa_minerals_network
     restart: unless-stopped
 
+
   python:
     build:
       context: .
@@ -93,8 +110,10 @@ services:
       DB_PASSWORD: alfapass123
       DB_NAME: alfa_minerals
       PREFECT_API_URL: http://prefect-server:4200/api
+      PREFECT_RESULTS_DEFAULT_STORAGE_BLOCK: "local-file-system/default"
     volumes:
       - .:/app
+      - prefect_results:/root/.prefect/results
     depends_on:
       - postgres
       - prefect-server
@@ -105,9 +124,12 @@ services:
     tty: true
     restart: unless-stopped
 
+
 volumes:
   postgres_data:
   prefect_data:
+  prefect_results:
+
 
 networks:
   alfa_minerals_network:
