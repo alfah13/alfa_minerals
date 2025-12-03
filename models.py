@@ -15,28 +15,33 @@ class Survey(Base):
     
     id = Column(Integer, primary_key=True)
     survey_id = Column(String(50), unique=True, nullable=False)  # e.g., "P-008"
-    line_id = Column(String(50))  # e.g., "50N"
+    line_id = Column(String(50))  # e.g., "50N" (direction: N=NS line, E=EW line)
     survey_date = Column(DateTime, nullable=False)
     
+    # CRS/Datum info
+    datum = Column(String(50), default="WGS 1984")  # WGS84
+    projection = Column(String(50), default="UTM")  # UTM
+    utm_zone = Column(String(10), default="22N")  # Zone 22 North
+    
     # File metadata
-    data_format = Column(String(50))  # "230"
+    data_format = Column(String(50))  # "230" or "210"
     data_units = Column(String(50))  # "nanoTesla/sec"
     operator_name = Column(String(255))
     
     # Equipment
     equipment_model = Column(String(255))  # "S-COIL Metric Crystal-Master 16.66"
-    coil_area = Column(Float)  # Coil area in m² (from HE3 tag)
-    coil_number = Column(String(50))  # "#117"
+    coil_area = Column(Float)
+    coil_number = Column(String(50))
     
     # Survey parameters
-    peak_current_amps = Column(Float)  # <CUR>
-    num_channels = Column(Integer)  # 16
+    peak_current_amps = Column(Float)
+    num_channels = Column(Integer)
     
     # Client/Company
     client_name = Column(String(255))  # "North American Nickel"
     acquisition_company = Column(String(255))  # "Crone Geophysics & Exploration Ltd."
     
-    # Raw header data (for reference)
+    # Raw header data
     header_data = Column(JSON)
     
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -46,36 +51,31 @@ class Survey(Base):
     loops = relationship("Loop", back_populates="survey", cascade="all, delete-orphan")
     receiver_stations = relationship("ReceiverStation", back_populates="survey", cascade="all, delete-orphan")
     measurements = relationship("EMResponse", back_populates="survey", cascade="all, delete-orphan")
-    
-    __table_args__ = (
-        Index("idx_survey_date_line", "survey_date", "line_id"),
-    )
 
 
 class Loop(Base):
-    """Transmitter loop from <L00> to <L82> tags"""
+    """Transmitter loop - always UTM Zone 22N, WGS84"""
     __tablename__ = "loops"
     
     id = Column(Integer, primary_key=True)
     survey_id = Column(Integer, ForeignKey("surveys.id"), nullable=False)
     
-    # Loop point identification
-    loop_point_number = Column(Integer)  # 0-82 from L00, L01, etc.
+    loop_point_number = Column(Integer)  # 0-82
+    loop_label = Column(String(50))  # Optional: descriptive name
     
-    # Coordinates (UTM or projected)
+    # UTM coordinates (Zone 22N, WGS84)
     easting = Column(Float, nullable=False)
     northing = Column(Float, nullable=False)
     elevation = Column(Float)
-    coordinate_units = Column(String(10), default="metres")  # "metres" or "feet"
     
-    # PostGIS geometry: Point with SRID 26918 (UTM Zone 18N)
-    geometry = Column(Geometry("POINT", srid=26918), index=True, nullable=True)
-    # WGS84 geometry for web mapping
-    geometry_wgs84 = Column(Geometry("POINT", srid=4326), index=True, nullable=True)
-    
-    # Loop geometry (from <TXS> tag)
+    # Loop dimensions (meters)
     loop_size_x_units = Column(Float)  # 600.0
     loop_size_y_units = Column(Float)  # 700.0
+    
+    # PostGIS geometry: Point with SRID 26918 (UTM Zone 18N)
+    # PostGIS geometry: UTM Zone 22N = SRID 32622
+    geometry = Column(Geometry("POINT", srid=32622), index=True, nullable=True)
+    geometry_wgs84 = Column(Geometry("POINT", srid=4326), index=True, nullable=True)
     
     created_at = Column(DateTime, default=datetime.utcnow)
     
@@ -89,29 +89,29 @@ class Loop(Base):
 
 
 class ReceiverStation(Base):
-    """Receiver/Profile station from <P00> to <P20> tags"""
+    """Receiver/Profile station - inherits CRS from Survey"""
     __tablename__ = "receiver_stations"
     
     id = Column(Integer, primary_key=True)
     survey_id = Column(Integer, ForeignKey("surveys.id"), nullable=False)
     
     # Station identification
-    station_number = Column(Integer, nullable=False)  # 0-20 from P00, P01, etc.
-    station_label = Column(String(50))  # e.g., "0N", "25N", "50N"
+    station_number = Column(Integer, nullable=False)
+    station_label = Column(String(50))  # e.g., "0N", "25N", "50N", "100E"
+    line_direction = Column(String(1))  # "N" or "E" from station_label
+    line_distance = Column(Float)  # 0, 25, 50, 100, etc.
     
-    # Coordinates
+    # UTM coordinates (same zone as survey)
     easting = Column(Float, nullable=False)
     northing = Column(Float, nullable=False)
     elevation = Column(Float)
-    coordinate_units = Column(String(10), default="metres")
-    
-    # PostGIS geometry: Point with SRID 26918 (UTM Zone 18N)
-    geometry = Column(Geometry("POINT", srid=26918), index=True, nullable=True)
-    # WGS84 geometry for web mapping
-    geometry_wgs84 = Column(Geometry("POINT", srid=4326), index=True, nullable=True)
     
     # Survey distance along profile
-    distance_along_profile_m = Column(Float)  # "stn" field: 0.0, 25.0, 50.0, etc.
+    distance_along_profile_m = Column(Float)
+    
+    # PostGIS geometry
+    geometry = Column(Geometry("POINT", srid=32622), index=True, nullable=True)
+    geometry_wgs84 = Column(Geometry("POINT", srid=4326), index=True, nullable=True)
     
     created_at = Column(DateTime, default=datetime.utcnow)
     
@@ -123,6 +123,7 @@ class ReceiverStation(Base):
         UniqueConstraint("survey_id", "station_number", name="uq_receiver_station"),
         Index("idx_receiver_location", "easting", "northing"),
     )
+
 
 
 class ComponentEnum(enum.Enum):

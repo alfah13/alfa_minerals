@@ -1,6 +1,7 @@
 """
-Crone PEM/STP data ingestion pipeline
+Crone PEM/STP data ingestion pipeline with PostGIS geometry
 """
+
 
 import os
 import re
@@ -10,12 +11,16 @@ from datetime import datetime
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
+
 from prefect import flow, task, get_run_logger
+from prefect.artifacts import create_markdown_artifact
+
 
 from models import (
     Base, Survey, Loop, ReceiverStation, EMResponse, OffTimeChannel, 
     ComponentEnum
 )
+
 
 
 def get_db_session():
@@ -34,7 +39,9 @@ def get_db_session():
     return Session()
 
 
+
 # ============= PARSING TASKS =============
+
 
 @task()
 def load_crone_file(file_path: str) -> tuple:
@@ -57,6 +64,7 @@ def load_crone_file(file_path: str) -> tuple:
     
     logger.info(f"Detected format: {file_format}")
     return content, file_format
+
 
 
 @task()
@@ -88,8 +96,14 @@ def parse_header(file_content: str) -> Dict:
                 if survey_id:
                     header['SURVEY_ID'] = survey_id
     
+    # Set CRS info for NAN Maniitsoq project
+    header['DATUM'] = 'WGS 1984'
+    header['PROJECTION'] = 'UTM'
+    header['UTM_ZONE'] = '22N'
+    
     logger.info(f"Parsed header: {header}")
     return header
+
 
 
 @task()
@@ -113,9 +127,10 @@ def parse_loop_coordinates(file_content: str) -> List[Dict]:
     return loops
 
 
+
 @task()
-def parse_receiver_stations(file_content: str) -> List[Dict]:
-    """Parse receiver stations"""
+def parse_receiver_stations(file_content: str, line_name: str) -> List[Dict]:
+    """Parse receiver stations with line context"""
     logger = get_run_logger()
     
     stations = []
@@ -123,69 +138,34 @@ def parse_receiver_stations(file_content: str) -> List[Dict]:
     
     for match in re.finditer(pattern, file_content):
         station_num = int(match.group(1))
+        distance_m = float(match.group(6))
+        
+        # Create composite label: "100E_00", "100E_01", etc.
+        # Or simpler: encode distance: "0m", "25m", "50m"
+        station_label = f"{distance_m:.0f}m"  # "0m", "25m", "50m"...
+        
         stations.append({
             'station_number': station_num,
+            'station_label': station_label,
+            'line_name': line_name,
             'easting': float(match.group(2)),
             'northing': float(match.group(3)),
             'elevation': float(match.group(4)),
             'units': int(match.group(5)),
-            'distance_m': float(match.group(6))
+            'distance_m': distance_m
         })
     
-    logger.info(f"Parsed {len(stations)} receiver stations")
+    logger.info(f"Parsed {len(stations)} stations on line {line_name}")
     return stations
 
 
-@task()
-def parse_time_gates(file_content: str) -> List[float]:
-    """Extract time gate values (between header and $ marker)"""
-    logger = get_run_logger()
-    
-    time_gates = []
-    
-    # Find the $ marker that separates time gates from data
-    dollar_idx = file_content.find('$')
-    if dollar_idx == -1:
-        logger.warning("No $ marker found")
-        return time_gates
-    
-    # Get text before $
-    header_section = file_content[:dollar_idx]
-    lines = header_section.split('\n')
-    
-    # Find time gate lines (numeric values in scientific or decimal notation)
-    time_gate_lines = []
-    for line in reversed(lines):  # Go backwards to find time gates
-        line = line.strip()
-        if not line or line.startswith('~') or line.startswith('<') or 'North American' in line:
-            continue
-        
-        # Try to parse as numbers
-        try:
-            vals = [float(v) for v in line.split()]
-            if vals:  # Found numeric line
-                time_gate_lines.insert(0, vals)
-                if len(vals) < 5:  # Likely end of time gates
-                    break
-        except ValueError:
-            continue
-    
-    # Flatten and filter out zeros/duplicates
-    for vals in time_gate_lines:
-        time_gates.extend(vals)
-    
-    logger.info(f"Parsed {len(time_gates)} time gates: {time_gates[:5]}... (showing first 5)")
-    return time_gates
-
 
 @task()
-def parse_measurements(file_content: str, time_gates: List[float]) -> List[Dict]:
-    """Parse EM measurement records (after $ marker)"""
+def parse_measurements(file_content: str, time_gates: List[float], line_name: str) -> List[Dict]:
+    """Parse measurements with line context"""
     logger = get_run_logger()
     
     measurements = []
-    
-    # Find data section (after $)
     dollar_idx = file_content.find('$')
     if dollar_idx == -1:
         logger.warning("No $ marker found")
@@ -194,63 +174,45 @@ def parse_measurements(file_content: str, time_gates: List[float]) -> List[Dict]
     data_section = file_content[dollar_idx + 1:]
     lines = data_section.split('\n')
     
-    # Patterns for different data formats
-    station_pattern = r'(\d{3}[A-Z]|[A-Z]\d{3}[A-Z]?\s+|[A-Z]\d{3}[A-Z]?|[A-Z]\d+[A-Z]?)\s+([XYZ]R\d+R?)\s+(\d+)\s+([A-Z])\s+([\d.]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)'
-    d4_pattern = r'D4\s+([-\d.e+]+)\s+([-\d.e+]+)\s+([-\d.e+]+)\s+([-\d.e+]+)'
-    d7_pattern = r'D7\s+([-\d.e+\s]+)'
+    # Station pattern: "100N", "125N", etc. (distances along profile)
+    station_pattern = r'(\d+[NSEWnsew])\s+([XYZxyz]R\d+R?)\s+(\d+)\s+([A-Z])\s+([\d.]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)'
     
     i = 0
     while i < len(lines):
         line = lines[i].strip()
         
-        # Try to match station line
         match = re.match(station_pattern, line)
         if match:
-            station_label = match.group(1).strip()
-            receiver_code = match.group(2)
+            # Extract just the numeric part: "100N" → "100"
+            station_distance_str = re.match(r'(\d+)', match.group(1)).group(1)
+            station_label = f"{float(station_distance_str):.0f}m"  # "100m", "125m", etc.
             
-            # Determine component
-            if 'Z' in receiver_code:
-                component = 'Z'
-            elif 'X' in receiver_code:
-                component = 'X'
-            elif 'Y' in receiver_code:
-                component = 'Y'
-            else:
-                component = 'UNK'  # default to unknown
+            receiver_code = match.group(2)
+            component = 'Z' if 'Z' in receiver_code.upper() else ('X' if 'X' in receiver_code.upper() else 'Y')
             
             current_record = {
                 'station_label': station_label,
+                'line_name': line_name,
                 'receiver_code': receiver_code,
                 'receiver_number': int(match.group(3)),
                 'angle': float(match.group(5)),
-                'num_samples': int(match.group(7)),
                 'component': component,
             }
             
-            # Next line should be D4 or D7
+            # Parse D4/D7 data...
             i += 1
             if i < len(lines):
-                d4_match = re.match(d4_pattern, lines[i].strip())
-                d7_match = re.match(d7_pattern, lines[i].strip())
-                
+                d4_match = re.match(r'D4\s+([-\d.e+]+)\s+([-\d.e+]+)\s+([-\d.e+]+)\s+([-\d.e+]+)', lines[i].strip())
                 if d4_match:
                     current_record['current_on_time'] = float(d4_match.group(1))
                     current_record['apparent_resistance'] = float(d4_match.group(2))
-                    current_record['phase_component'] = float(d4_match.group(3))
-                    current_record['phase_magnitude'] = float(d4_match.group(4))
-                elif d7_match:
-                    # D7 format - just skip
-                    pass
             
-            # Next lines are data
             i += 1
             channel_data = []
             while i < len(lines):
                 data_line = lines[i].strip()
-                if not data_line or data_line.startswith(('100', '125', '150', '175', '200', '225', '250', 'D')) or re.match(station_pattern, data_line):
+                if not data_line or re.match(r'^\d{3}[NSEWnsew]|^[A-Z]\d{3}|^D[47]', data_line):
                     break
-                
                 try:
                     vals = [float(v) for v in data_line.split()]
                     channel_data.extend(vals)
@@ -260,18 +222,58 @@ def parse_measurements(file_content: str, time_gates: List[float]) -> List[Dict]
             
             if channel_data:
                 current_record['primary_pulse'] = channel_data[0]
-                current_record['channels'] = channel_data[1:] if len(channel_data) > 1 else []
+                current_record['channels'] = channel_data[1:]
                 measurements.append(current_record)
-                logger.debug(f"Parsed: {station_label} / {component} with {len(channel_data)} values")
                 continue
         
         i += 1
     
-    logger.info(f"Parsed {len(measurements)} total measurement records")
+    logger.info(f"Parsed {len(measurements)} measurements on line {line_name}")
     return measurements
 
 
+
+
+@task()
+def parse_time_gates(file_content: str) -> List[float]:
+    """Extract time gate values"""
+    logger = get_run_logger()
+    
+    time_gates = []
+    dollar_idx = file_content.find('$')
+    if dollar_idx == -1:
+        logger.warning("No $ marker found")
+        return time_gates
+    
+    header_section = file_content[:dollar_idx]
+    lines = header_section.split('\n')
+    
+    time_gate_lines = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line or line.startswith('~') or line.startswith('<') or 'North American' in line:
+            continue
+        
+        try:
+            vals = [float(v) for v in line.split()]
+            if vals:
+                time_gate_lines.insert(0, vals)
+                if len(vals) < 5:
+                    break
+        except ValueError:
+            continue
+    
+    for vals in time_gate_lines:
+        time_gates.extend(vals)
+    
+    logger.info(f"Parsed {len(time_gates)} time gates: {time_gates[:5]}... (showing first 5)")
+    return time_gates
+
+
+
+
 # ============= DATABASE STORAGE TASKS =============
+
 
 @task()
 def store_survey(header: Dict, file_path: str) -> Dict:
@@ -297,13 +299,17 @@ def store_survey(header: Dict, file_path: str) -> Dict:
         peak_current_amps=float(header.get('CUR', 0)) if header.get('CUR') else 0,
         client_name='North American Nickel',
         acquisition_company='Crone Geophysics & Exploration Ltd.',
+        datum=header.get('DATUM', 'WGS 1984'),
+        projection=header.get('PROJECTION', 'UTM'),
+        utm_zone=header.get('UTM_ZONE', '22N'),
         header_data=header,
     )
     session.add(survey)
     session.commit()
-    logger.info(f"Created survey: {survey.id}")
+    logger.info(f"Created survey: {survey.id} (UTM {survey.utm_zone}, {survey.datum})")
     session.close()
     return {'survey_id': survey.id, 'survey_record': 1}
+
 
 
 @task()
@@ -320,7 +326,8 @@ def store_loops(survey_id: int, loops: List[Dict]) -> Dict:
         return {'loops_stored': existing_count, 'new_loops': 0}
     
     for loop_data in loops:
-        utm_geom = f"SRID=26918;POINT({loop_data['easting']} {loop_data['northing']})"
+        # UTM Zone 22N = SRID 32622
+        utm_geom = f"SRID=32622;POINT({loop_data['easting']} {loop_data['northing']})"
         
         loop = Loop(
             survey_id=survey_id,
@@ -328,7 +335,6 @@ def store_loops(survey_id: int, loops: List[Dict]) -> Dict:
             easting=loop_data["easting"],
             northing=loop_data["northing"],
             elevation=loop_data["elevation"],
-            coordinate_units="metres" if loop_data["units"] == 0 else "feet",
             loop_size_x_units=loop_data.get("loop_size_x", 600.0),
             loop_size_y_units=loop_data.get("loop_size_y", 700.0),
             geometry=utm_geom,
@@ -337,6 +343,7 @@ def store_loops(survey_id: int, loops: List[Dict]) -> Dict:
     
     session.commit()
     
+    # Transform to WGS84
     session.execute(sa.text("""
         UPDATE loops 
         SET geometry_wgs84 = ST_Transform(geometry, 4326)
@@ -349,9 +356,10 @@ def store_loops(survey_id: int, loops: List[Dict]) -> Dict:
     return {'loops_stored': existing_count + len(loops), 'new_loops': len(loops)}
 
 
+
 @task()
 def store_receiver_stations(survey_id: int, stations: List[Dict]) -> Dict:
-    """Store receiver profile stations"""
+    """Store receiver stations with line tracking"""
     logger = get_run_logger()
     
     session = get_db_session()
@@ -363,58 +371,55 @@ def store_receiver_stations(survey_id: int, stations: List[Dict]) -> Dict:
         return {'stations_stored': existing_count, 'new_stations': 0}
     
     for station_data in stations:
-        station_label = f"{station_data['station_number']:02d}N"
+        line_name = station_data.get('line_name', 'UNK')
+        station_label = station_data.get('station_label', f"{station_data['station_number']:02d}N")
         
-        utm_geom = f"SRID=26918;POINT({station_data['easting']} {station_data['northing']})"
+        # Parse direction from label or line_name
+        line_direction = line_name[-1] if line_name else 'N'  # Last char of "100E" is 'E'
+        
+        utm_geom = f"SRID=32622;POINT({station_data['easting']} {station_data['northing']})"
         
         station = ReceiverStation(
             survey_id=survey_id,
             station_number=station_data["station_number"],
-            station_label=station_label,
+            station_label=station_label,  # "0m", "25m", "50m"...
+            line_direction=line_direction,
+            line_distance=station_data["distance_m"],
             easting=station_data["easting"],
             northing=station_data["northing"],
             elevation=station_data["elevation"],
-            coordinate_units="metres" if station_data["units"] == 0 else "feet",
             distance_along_profile_m=station_data["distance_m"],
             geometry=utm_geom,
         )
         session.add(station)
     
     session.commit()
-    
     session.execute(sa.text("""
         UPDATE receiver_stations 
         SET geometry_wgs84 = ST_Transform(geometry, 4326)
         WHERE survey_id = :survey_id AND geometry_wgs84 IS NULL
     """), {"survey_id": survey_id})
-    
     session.commit()
-    logger.info(f"Stored {len(stations)} receiver stations with geometry")
+    logger.info(f"Stored {len(stations)} receiver stations")
     session.close()
-    return {'stations_stored': existing_count + len(stations), 'new_stations': len(stations)}
+    return {'stations_stored': len(stations), 'new_stations': len(stations)}
+
+
 
 
 @task()
 def store_em_responses(survey_id: int, measurements: List[Dict], time_gates: List[float], source_file: str) -> Dict:
-    """Store EM responses and off-time channels"""
+    """Store EM responses matching by station label"""
     logger = get_run_logger()
     
     session = get_db_session()
     
-    # Build map of actual distance to station
     all_stations = session.query(ReceiverStation).filter_by(survey_id=survey_id).all()
+    # Map by station_label (e.g., "100N", "125N")
+    station_label_map = {s.station_label: s for s in all_stations}
     
-    # Map by distance (more reliable than station_number)
-    distance_to_station = {}
-    station_label_map = {}
-    
-    for station in all_stations:
-        distance_to_station[station.distance_along_profile_m] = station
-        station_label_map[station.station_label] = station
-    
-    logger.info(f"Available stations by label: {sorted(list(station_label_map.keys()))}")
-    logger.info(f"Available stations by distance: {sorted(list(distance_to_station.keys()))}")
-    logger.info(f"Processing {len(measurements)} measurements")
+    logger.info(f"Available stations: {sorted(list(station_label_map.keys()))}")
+    logger.info(f"Processing {len(measurements)} measurements from {source_file}")
     
     response_count = 0
     channel_count = 0
@@ -422,44 +427,17 @@ def store_em_responses(survey_id: int, measurements: List[Dict], time_gates: Lis
     duplicates = 0
     
     for meas in measurements:
-        station_label = meas['station_label']
+        meas_station_label = meas['station_label']  # e.g., "100N"
         component = meas['component']
         
-        # Try multiple matching strategies
-        station = None
-        
-        # Strategy 1: Direct label match
-        if station_label in station_label_map:
-            station = station_label_map[station_label]
-            logger.debug(f"Matched {station_label} by label")
-        
-        # Strategy 2: Extract numeric part and match by distance
-        if not station:
-            match = re.match(r'(\d+)', station_label)
-            if match:
-                distance = float(match.group(1))
-                if distance in distance_to_station:
-                    station = distance_to_station[distance]
-                    logger.debug(f"Matched {station_label} by distance {distance}m")
-        
-        # Strategy 3: Fuzzy match on distance (closest station)
-        if not station:
-            match = re.match(r'(\d+)', station_label)
-            if match:
-                distance = float(match.group(1))
-                distances = list(distance_to_station.keys())
-                if distances:
-                    closest_distance = min(distances, key=lambda d: abs(d - distance))
-                    if abs(closest_distance - distance) < 50:  # Within 50m
-                        station = distance_to_station[closest_distance]
-                        logger.debug(f"Matched {station_label} by fuzzy distance (closest: {closest_distance}m)")
+        station = station_label_map.get(meas_station_label)
         
         if not station:
-            logger.warning(f"Station '{station_label}' not found (available: {sorted(list(station_label_map.keys()))})")
+            logger.debug(f"Station '{meas_station_label}' not found")
             skipped += 1
             continue
         
-        # Check if this response already exists
+        # Check for duplicate
         existing = session.query(EMResponse).filter_by(
             survey_id=survey_id,
             receiver_station_id=station.id,
@@ -468,7 +446,7 @@ def store_em_responses(survey_id: int, measurements: List[Dict], time_gates: Lis
         ).first()
         
         if existing:
-            logger.debug(f"Skipping duplicate: {station_label}/{component} from {source_file}")
+            logger.debug(f"Skipping duplicate: {meas_station_label}/{component}")
             duplicates += 1
             continue
         
@@ -480,10 +458,6 @@ def store_em_responses(survey_id: int, measurements: List[Dict], time_gates: Lis
             station_label=meas['station_label'],
             receiver_code=meas['receiver_code'],
             primary_pulse_nt_per_sec=meas.get('primary_pulse', 0),
-            secondary_pulse_1=meas.get('secondary_1'),
-            secondary_pulse_2=meas.get('secondary_2'),
-            current_on_time_value=meas.get('current_on_time'),
-            apparent_resistance=meas.get('apparent_resistance'),
         )
         session.add(response)
         session.flush()
@@ -506,7 +480,7 @@ def store_em_responses(survey_id: int, measurements: List[Dict], time_gates: Lis
         response_count += 1
     
     session.commit()
-    logger.info(f"Stored {response_count} EM responses, {channel_count} channels ({duplicates} duplicates skipped, {skipped} stations not found)")
+    logger.info(f"✅ Stored {response_count} responses, {channel_count} channels ({duplicates} dups, {skipped} not found)")
     session.close()
     return {
         'responses_stored': response_count,
@@ -517,25 +491,30 @@ def store_em_responses(survey_id: int, measurements: List[Dict], time_gates: Lis
 
 
 
-@flow()
+# ============= MAIN FLOWS =============
+
+
+@flow()  # Change from @task() to @flow()
 def ingest_crone_pem_flow(file_path: str):
-    """Complete Crone PEM data ingestion"""
+    """Complete Crone PEM data ingestion with line name from filename"""
     logger = get_run_logger()
     
     file_name = Path(file_path).name
-    logger.info(f"🚀 Starting ingestion: {file_path}\n")
     
-    # Load and detect format
+    # Extract line name from filename: "100EAV.STP" → "100E"
+    line_name_match = re.match(r'([A-Z0-9]+[NSEWnsew])', file_name)
+    line_name = line_name_match.group(1).upper() if line_name_match else file_name.split('.')[0]
+    
+    logger.info(f"🚀 Starting ingestion: {file_path} (Line: {line_name})\n")
+    
     file_content, file_format = load_crone_file(file_path)
     
-    # Parse
     header = parse_header(file_content)
     loops = parse_loop_coordinates(file_content)
-    stations = parse_receiver_stations(file_content)
+    stations = parse_receiver_stations(file_content, line_name)
     time_gates = parse_time_gates(file_content)
-    measurements = parse_measurements(file_content, time_gates)
+    measurements = parse_measurements(file_content, time_gates, line_name)
     
-    # Store
     survey_result = store_survey(header, file_path)
     survey_id = survey_result['survey_id']
     
@@ -572,6 +551,7 @@ def ingest_crone_pem_flow(file_path: str):
     return result
 
 
+
 @flow()
 def ingest_crone_dir_flow(dir_path: str) -> Dict:
     """Ingest all .STP / .PEM files in directory"""
@@ -596,7 +576,6 @@ def ingest_crone_dir_flow(dir_path: str) -> Dict:
         result = ingest_crone_pem_flow(str(f))
         results.append(result)
     
-    # Aggregate totals
     total_surveys = sum(r['survey_rows'] for r in results)
     total_loops = sum(r['loops_rows'] for r in results)
     total_stations = sum(r['stations_rows'] for r in results)
@@ -629,28 +608,25 @@ def ingest_crone_dir_flow(dir_path: str) -> Dict:
     return summary
 
 
-from prefect import task, flow
-from prefect.filesystems import LocalFileSystem
-from prefect.artifacts import create_markdown_artifact
 
-# Configure result storage
-result_storage = LocalFileSystem(path="/root/.prefect/results")
-
-@flow(result_storage=result_storage)
+@flow()
 def ingest_all_surveys_flow(base_dir: str = "./data/data_archive") -> Dict:
-    """Ingest all survey folders"""
+    """Ingest all survey folders - processes ALL folders, not just first"""
     logger = get_run_logger()
     
     base_path = Path(base_dir)
     if not base_path.exists():
         raise ValueError(f"Base directory {base_dir} does not exist")
     
-    survey_folders = sorted([d.name for d in base_path.iterdir() if d.is_dir()])
+    # Find all P-* folders using iterdir and filtering (more reliable than glob)
+    survey_folders = sorted([d for d in base_path.iterdir() if d.is_dir() and d.name.startswith("P-")])
     
     if not survey_folders:
         raise ValueError(f"No survey folders found in {base_dir}")
     
-    logger.info(f"Found {len(survey_folders)} survey folders: {survey_folders}")
+    logger.info(f"Found {len(survey_folders)} survey folders")
+    for folder in survey_folders:
+        logger.info(f"  - {folder.name}")
     
     all_results = []
     grand_totals = {
@@ -662,10 +638,9 @@ def ingest_all_surveys_flow(base_dir: str = "./data/data_archive") -> Dict:
     }
     
     for folder in survey_folders:
-        folder_path = base_path / folder
-        logger.info(f"🚀 Ingesting survey folder: {folder}")
+        logger.info(f"\n🚀 Ingesting survey folder: {folder.name}")
         try:
-            result = ingest_crone_dir_flow(str(folder_path))
+            result = ingest_crone_dir_flow(str(folder))
             all_results.append(result)
             
             grand_totals['survey_rows'] += result.get('survey_rows', 0)
@@ -674,9 +649,10 @@ def ingest_all_surveys_flow(base_dir: str = "./data/data_archive") -> Dict:
             grand_totals['responses_rows'] += result.get('responses_rows', 0)
             grand_totals['channels_rows'] += result.get('channels_rows', 0)
             
-            logger.info(f"✅ Completed {folder}: {result.get('files_processed', 0)} files")
+            logger.info(f"✅ Completed {folder.name}: {result.get('files_processed', 0)} files")
         except Exception as e:
-            logger.error(f"❌ Failed {folder}: {e}")
+            logger.error(f"❌ Failed {folder.name}: {e}")
+            continue
     
     final_result = {
         'total_surveys': len(survey_folders),
@@ -689,9 +665,9 @@ def ingest_all_surveys_flow(base_dir: str = "./data/data_archive") -> Dict:
         'survey_results': all_results
     }
     
-    # Create artifact with results summary
     summary_md = f"""
 # Data Ingestion Results
+
 
 | Table | Rows Added |
 |-------|-----------|
@@ -702,6 +678,13 @@ def ingest_all_surveys_flow(base_dir: str = "./data/data_archive") -> Dict:
 | Channels | {grand_totals['channels_rows']} |
 | **TOTAL** | **{sum(grand_totals.values())}** |
 
+
+## Coordinate System
+- **Datum**: WGS 1984
+- **Projection**: UTM Zone 22N
+- **SRID**: 32622 (UTM 22N), 4326 (WGS84)
+
+
 ## Summary
 - **Survey Folders**: {len(survey_folders)}
 - **Completed**: {len(all_results)}
@@ -711,13 +694,13 @@ def ingest_all_surveys_flow(base_dir: str = "./data/data_archive") -> Dict:
     create_markdown_artifact(
         key="ingestion-summary",
         markdown=summary_md,
-        description="Data ingestion summary"
+        description="Data ingestion summary with CRS info"
     )
     
     logger.info(f"""
     🎉🎉🎉 ALL SURVEYS COMPLETE 🎉🎉🎉
     📊 Surveys table: {grand_totals['survey_rows']} rows
-    🔵 Loops table: {grand_totals['loops_rows']} rows
+    🔵 Loops table: {grand_totals['loops_rows']} rows (UTM 22N, WGS84)
     🟢 Stations table: {grand_totals['stations_rows']} rows
     📈 Responses table: {grand_totals['responses_rows']} rows
     📉 Channels table: {grand_totals['channels_rows']} rows
@@ -726,8 +709,10 @@ def ingest_all_surveys_flow(base_dir: str = "./data/data_archive") -> Dict:
     return final_result
 
 
+
 if __name__ == "__main__":
     import sys
+
 
     if len(sys.argv) > 1 and sys.argv[1] == "--all":
         print("Ingesting all survey folders...")
