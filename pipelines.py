@@ -270,13 +270,10 @@ def parse_time_gates(file_content: str) -> List[float]:
     return time_gates
 
 
-
-
 # ============= DATABASE STORAGE TASKS =============
 
-
 @task()
-def store_survey(header: Dict, file_path: str) -> Dict:
+def save_survey(header: Dict, file_path: str) -> Dict:
     """Create or get Survey record"""
     logger = get_run_logger()
     
@@ -313,7 +310,7 @@ def store_survey(header: Dict, file_path: str) -> Dict:
 
 
 @task()
-def store_loops(survey_id: int, loops: List[Dict]) -> Dict:
+def save_loops(survey_id: int, loops: List[Dict]) -> Dict:
     """Store transmitter loop coordinates"""
     logger = get_run_logger()
     
@@ -358,7 +355,7 @@ def store_loops(survey_id: int, loops: List[Dict]) -> Dict:
 
 
 @task()
-def store_receiver_stations(survey_id: int, stations: List[Dict]) -> Dict:
+def save_receiver_stations(survey_id: int, stations: List[Dict]) -> Dict:
     """Store receiver stations with line tracking"""
     logger = get_run_logger()
     
@@ -408,7 +405,7 @@ def store_receiver_stations(survey_id: int, stations: List[Dict]) -> Dict:
 
 
 @task()
-def store_em_responses(survey_id: int, measurements: List[Dict], time_gates: List[float], source_file: str) -> Dict:
+def save_em_responses(survey_id: int, measurements: List[Dict], time_gates: List[float], source_file: str) -> Dict:
     """Store EM responses matching by station label"""
     logger = get_run_logger()
     
@@ -515,12 +512,12 @@ def ingest_crone_pem_flow(file_path: str):
     time_gates = parse_time_gates(file_content)
     measurements = parse_measurements(file_content, time_gates, line_name)
     
-    survey_result = store_survey(header, file_path)
+    survey_result = save_survey(header, file_path)
     survey_id = survey_result['survey_id']
     
-    loops_result = store_loops(survey_id, loops)
-    stations_result = store_receiver_stations(survey_id, stations)
-    responses_result = store_em_responses(survey_id, measurements, time_gates, file_name)
+    loops_result = save_loops(survey_id, loops)
+    stations_result = save_receiver_stations(survey_id, stations)
+    responses_result = save_em_responses(survey_id, measurements, time_gates, file_name)
     
     result = {
         'file': file_path,
@@ -698,7 +695,7 @@ def ingest_all_surveys_flow(base_dir: str = "./data/data_archive") -> Dict:
     )
     
     logger.info(f"""
-    🎉🎉🎉 ALL SURVEYS COMPLETE 🎉🎉🎉
+    ALL SURVEYS COMPLETE 
     📊 Surveys table: {grand_totals['survey_rows']} rows
     🔵 Loops table: {grand_totals['loops_rows']} rows (UTM 22N, WGS84)
     🟢 Stations table: {grand_totals['stations_rows']} rows
